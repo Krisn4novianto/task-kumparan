@@ -1,0 +1,40 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+*.zip
+.pytest_cache/
+
+# Environment & credentials
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local files
+.DS_Store
+*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local files
+.DS_Store
+*.log

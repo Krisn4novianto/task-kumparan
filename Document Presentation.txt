@@ -1,0 +1,176 @@
+/* ============================================================================
+   KUMPARAN | DATA ENGINEER ASSESSMENT
+   VALIDASI ETL DAN PENGECEKAN UNTUK PRESENTASI
+   ============================================================================
+   Database : Kumparan_Source (Operasional/OLTP) + Kumparan_DWH (SQL Server)
+   Pipeline : kumparan_articles_hourly (Apache Airflow, 8 task)
+   Panduan  : Buka di DBeaver dan jalankan setiap blok SELECT secara terpisah.
+   Keamanan : Hanya membaca data (READ-ONLY). Tidak ada perintah perubahan data.
+
+   URUTAN PENGECEKAN PRESENTASI
+   01. Monitoring eksekusi pipeline
+   02. Watermark untuk pemrosesan incremental
+   03. Hasil pemeriksaan kualitas data
+   04. Jumlah data pada setiap lapisan
+   05. Rekonsiliasi data Source dan Core
+   06. Status publikasi dan penghapusan data di Core
+   07. Riwayat perubahan artikel
+   08. Rekonsiliasi tabel fakta dan agregasi harian
+   09. Contoh agregasi harian berdasarkan penulis
+   10. Ringkasan hasil eksekusi pipeline terakhir
+
+   CATATAN:
+   Status SUCCESS pada Airflow menunjukkan bahwa task telah selesai dijalankan.
+   Pemeriksaan SQL ini digunakan untuk memastikan hasil pengolahan data sesuai
+   dengan kondisi yang diharapkan.
+
+   Jumlah data yang diekstraksi dapat bernilai 0 apabila tidak terdapat
+   penambahan atau perubahan data sejak eksekusi terakhir yang berhasil.
+   ============================================================================ */
+
+-- 01 | MONITORING EKSEKUSI PIPELINE
+-- Hasil yang diharapkan: status eksekusi terakhir menunjukkan keberhasilan.
+SELECT TOP (10)
+    run_id, dag_id, airflow_run_id, status,
+    started_at, finished_at,
+    DATEDIFF(SECOND, started_at, finished_at) AS duration_seconds,
+    extracted_count, inserted_count, updated_count,
+    soft_deleted_count, hard_deleted_count, error_message
+FROM Kumparan_DWH.etl.pipeline_runs
+ORDER BY run_id DESC;
+
+-- 02 | WATERMARK PEMROSESAN INCREMENTAL
+-- Hasil yang diharapkan: nama pipeline tercatat dan last_success_run_id
+-- mengacu pada eksekusi pipeline yang berhasil.
+SELECT pipeline_name, last_updated_at, last_article_id, last_success_run_id, recorded_at
+FROM Kumparan_DWH.etl.watermarks
+ORDER BY pipeline_name;
+
+-- 03 | HASIL PEMERIKSAAN KUALITAS DATA TERBARU
+-- Hasil yang diharapkan: seluruh pemeriksaan pada eksekusi terakhir
+-- memiliki nilai passed = 1.
+SELECT q.run_id, q.check_name, q.passed, CASE WHEN q.passed = 1 THEN 'PASS' ELSE 'FAIL' END AS dq_status, q.observed_value, q.expected_value, q.checked_at, q.details
+FROM Kumparan_DWH.etl.data_quality_results AS q
+WHERE q.run_id = (
+    SELECT MAX(run_id) FROM Kumparan_DWH.etl.data_quality_results
+)
+ORDER BY q.check_name;
+
+-- 04 | JUMLAH DATA PADA SETIAP LAPISAN
+-- Hasil yang diharapkan: jumlah data Source dan Core umumnya sesuai.
+-- Fact hanya mencakup artikel yang memenuhi kriteria publikasi.
+-- Staging dapat menyimpan beberapa batch historis dari artikel yang sama.
+SELECT '01 - SOURCE (OLTP)' AS data_layer, COUNT_BIG(*) AS total_rows
+FROM Kumparan_Source.dbo.articles
+UNION ALL
+SELECT '02 - STAGING (all batches)', COUNT_BIG(*)
+FROM Kumparan_DWH.stg.articles_raw
+UNION ALL
+SELECT '03 - CORE (all records)', COUNT_BIG(*)
+FROM Kumparan_DWH.core.articles
+UNION ALL
+SELECT '04 - MART FACT (published)', COUNT_BIG(*)
+FROM Kumparan_DWH.mart.fact_article_publication
+UNION ALL
+SELECT '05 - MART DIM AUTHOR', COUNT_BIG(*)
+FROM Kumparan_DWH.mart.dim_author
+UNION ALL
+SELECT '06 - MART DIM DATE', COUNT_BIG(*)
+FROM Kumparan_DWH.mart.dim_date;
+
+-- 05 | REKONSILIASI DATA SOURCE DAN CORE
+-- Hasil yang diharapkan: missing_in_active_core = 0 dan
+-- unexpected_active_in_core = 0 setelah sinkronisasi berhasil.
+-- Artikel yang mengalami hard delete dapat tetap tersimpan di Core,
+-- tetapi ditandai sebagai data yang telah dihapus secara permanen.
+SELECT
+    (SELECT COUNT_BIG(*) FROM Kumparan_Source.dbo.articles) AS source_rows,
+    (SELECT COUNT_BIG(*) FROM Kumparan_DWH.core.articles
+     WHERE is_hard_deleted = 0) AS active_core_rows,
+    (SELECT COUNT_BIG(*)
+     FROM Kumparan_Source.dbo.articles AS s
+     WHERE NOT EXISTS (
+         SELECT 1 FROM Kumparan_DWH.core.articles AS c
+         WHERE c.id = s.id AND c.is_hard_deleted = 0
+     )) AS missing_in_active_core,
+    (SELECT COUNT_BIG(*)
+     FROM Kumparan_DWH.core.articles AS c
+     WHERE c.is_hard_deleted = 0
+       AND NOT EXISTS (
+           SELECT 1 FROM Kumparan_Source.dbo.articles AS s
+           WHERE s.id = c.id
+       )) AS unexpected_active_in_core;
+
+-- 06 | STATUS SOFT DELETE DAN HARD DELETE PADA CORE
+-- Pemeriksaan ini digunakan untuk mengetahui jumlah keseluruhan artikel,
+-- artikel yang dihapus secara soft delete, artikel yang mengalami
+-- hard delete, serta artikel yang masih aktif.
+SELECT
+    COUNT_BIG(*) AS total_core_rows,
+    SUM(CASE WHEN deleted_at IS NOT NULL THEN CAST(1 AS BIGINT) ELSE 0 END) AS soft_deleted_rows,
+    SUM(CASE WHEN is_hard_deleted = 1 THEN CAST(1 AS BIGINT) ELSE 0 END) AS hard_deleted_rows,
+    SUM(CASE WHEN deleted_at IS NULL AND is_hard_deleted = 0
+             THEN CAST(1 AS BIGINT) ELSE 0 END) AS active_rows
+FROM Kumparan_DWH.core.articles;
+
+-- 07 | RIWAYAT PERUBAHAN DAN AUDIT ARTIKEL
+-- Riwayat dapat kosong apabila belum terdapat perubahan artikel
+-- yang diproses dan dicatat selama pengujian.
+SELECT TOP (20)
+    change_id, article_id, run_id, change_type,
+    old_title, new_title, old_updated_at, new_updated_at, changed_at
+FROM Kumparan_DWH.core.article_change_history
+ORDER BY change_id DESC;
+
+-- 08 | REKONSILIASI FACT DAN AGREGASI HARIAN
+-- Hasil yang diharapkan: difference = 0.
+-- Jumlah artikel pada tabel fakta harus sesuai dengan total artikel
+-- yang tercatat pada tabel agregasi publikasi harian.
+SELECT
+    (SELECT COUNT_BIG(*) FROM Kumparan_DWH.mart.fact_article_publication)
+        AS fact_article_rows,
+    (SELECT COALESCE(SUM(CAST(published_articles AS BIGINT)), 0)
+     FROM Kumparan_DWH.mart.agg_article_daily) AS daily_aggregate_articles,
+    (SELECT COUNT_BIG(*) FROM Kumparan_DWH.mart.fact_article_publication)
+      - (SELECT COALESCE(SUM(CAST(published_articles AS BIGINT)), 0)
+         FROM Kumparan_DWH.mart.agg_article_daily) AS difference;
+
+-- 09 | CONTOH AGREGASI PUBLIKASI HARIAN BERDASARKAN PENULIS
+-- Menampilkan 15 data agregasi terbaru berdasarkan tanggal,
+-- jumlah artikel yang dipublikasikan, dan identitas penulis.
+SELECT TOP (15)
+    date_key, author_id, published_articles, refreshed_at
+FROM Kumparan_DWH.mart.agg_author_daily
+ORDER BY date_key DESC, published_articles DESC, author_id;
+
+-- 10 | RINGKASAN EKSEKUSI PIPELINE TERAKHIR
+-- Menampilkan status eksekusi terakhir, jumlah data yang diproses,
+-- serta jumlah pemeriksaan kualitas data yang berhasil dan gagal.
+-- Hasil pemeriksaan kualitas data diambil berdasarkan run_id yang sama.
+SELECT TOP (1)
+    p.run_id,
+    p.status AS pipeline_status,
+    p.started_at,
+    p.finished_at,
+    p.extracted_count,
+    p.inserted_count,
+    p.updated_count,
+    p.soft_deleted_count,
+    p.hard_deleted_count,
+    (SELECT COUNT_BIG(*)
+     FROM Kumparan_DWH.etl.data_quality_results AS q
+     WHERE q.run_id = p.run_id) AS dq_total_checks,
+    (SELECT COUNT_BIG(*)
+     FROM Kumparan_DWH.etl.data_quality_results AS q
+     WHERE q.run_id = p.run_id AND q.passed = 1) AS dq_passed_checks,
+    (SELECT COUNT_BIG(*)
+     FROM Kumparan_DWH.etl.data_quality_results AS q
+     WHERE q.run_id = p.run_id AND q.passed = 0) AS dq_failed_checks
+FROM Kumparan_DWH.etl.pipeline_runs AS p
+ORDER BY p.run_id DESC;
+
+/* ============================================================================
+   AKHIR PENGECEKAN VALIDASI ETL
+   Seluruh query pada dokumen ini hanya digunakan untuk membaca dan
+   memeriksa data tanpa melakukan perubahan terhadap database.
+   ============================================================================ */

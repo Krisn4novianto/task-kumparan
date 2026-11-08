@@ -1,0 +1,79 @@
+
+services:
+  airflow-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_metadata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U airflow -d airflow
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    build: .
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    env_file: .env
+    environment: &airflow_env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD_URLENCODED}@airflow-db:5432/airflow"
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl/sql:/opt/airflow/etl/sql:ro
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        if ! airflow users list | grep -q 'admin'; then
+          airflow users create \
+            --username admin \
+            --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+            --firstname Local \
+            --lastname Admin \
+            --role Admin \
+            --email admin@example.local
+        fi
+
+  airflow-webserver:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment: *airflow_env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl/sql:/opt/airflow/etl/sql:ro
+    ports:
+      - "8080:8080"
+    command: webserver
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  airflow-scheduler:
+    build: .
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file: .env
+    environment: *airflow_env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./etl/sql:/opt/airflow/etl/sql:ro
+    command: scheduler
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  airflow_metadata:
